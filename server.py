@@ -1,20 +1,33 @@
+import argparse
+import io
 import socket
 import threading
 from datetime import datetime
 from pathlib import Path
 
 
-HOST = "127.0.0.1"
-PORT = 5000
-BUFFER_SIZE = 1024
+DEFAULT_HOST = "127.0.0.1"
+DEFAULT_PORT = 5000
 ENCODING = "utf-8"
-LOG_FILE = Path("server.log")
+DEFAULT_LOG_FILE = Path("server.log")
+
+COMMAND_HELP = """[System] Commands:
+  /help                 Show command list
+  /users                Show connected users
+  /msg <nickname> <msg> Send a private message
+  /quit                 Leave the chat"""
 
 
 class ChatServer:
-    def __init__(self, host: str = HOST, port: int = PORT) -> None:
+    def __init__(
+        self,
+        host: str = DEFAULT_HOST,
+        port: int = DEFAULT_PORT,
+        log_file: Path = DEFAULT_LOG_FILE,
+    ) -> None:
         self.host = host
         self.port = port
+        self.log_file = log_file
         self.clients: dict[socket.socket, str] = {}
         self.clients_lock = threading.Lock()
 
@@ -23,7 +36,7 @@ class ChatServer:
         formatted = f"[{timestamp}] {message}"
         print(formatted)
 
-        with LOG_FILE.open("a", encoding=ENCODING) as log_file:
+        with self.log_file.open("a", encoding=ENCODING) as log_file:
             log_file.write(formatted + "\n")
 
     def send_message(self, client_socket: socket.socket, message: str) -> None:
@@ -73,24 +86,37 @@ class ChatServer:
 
         return ", ".join(nicknames)
 
+    def find_client_by_nickname(self, nickname: str) -> socket.socket | None:
+        with self.clients_lock:
+            for client_socket, current_nickname in self.clients.items():
+                if current_nickname == nickname:
+                    return client_socket
+
+        return None
+
     def register_client(
         self,
         client_socket: socket.socket,
         address: tuple[str, int],
+        reader: io.TextIOWrapper,
     ) -> str | None:
         self.send_message(client_socket, "Enter your nickname:")
 
         try:
-            nickname_data = client_socket.recv(BUFFER_SIZE)
+            nickname_data = reader.readline()
         except OSError:
             return None
 
         if not nickname_data:
             return None
 
-        nickname = nickname_data.decode(ENCODING).strip()
+        nickname = nickname_data.strip()
         if not nickname:
             self.send_message(client_socket, "[System] Empty nickname is not allowed.")
+            return None
+
+        if nickname.startswith("/"):
+            self.send_message(client_socket, "[System] Nickname cannot start with '/'.")
             return None
 
         with self.clients_lock:
@@ -102,9 +128,72 @@ class ChatServer:
 
         self.log_event(f"{nickname} connected from {address[0]}:{address[1]}")
         self.send_message(client_socket, f"[System] Welcome, {nickname}!")
-        self.send_message(client_socket, "[System] Commands: /users, /quit")
+        self.send_message(client_socket, COMMAND_HELP)
         self.broadcast(f"[System] {nickname} joined the chat.", exclude=client_socket)
         return nickname
+
+    def handle_command(
+        self,
+        client_socket: socket.socket,
+        nickname: str,
+        message: str,
+    ) -> bool:
+        command, _, arguments = message.partition(" ")
+
+        if command == "/quit":
+            self.send_message(client_socket, "[System] Disconnecting...")
+            return False
+
+        if command == "/help":
+            self.send_message(client_socket, COMMAND_HELP)
+            return True
+
+        if command == "/users":
+            self.send_message(
+                client_socket,
+                f"[System] Connected users: {self.list_users()}",
+            )
+            return True
+
+        if command == "/msg":
+            self.send_private_message(client_socket, nickname, arguments)
+            return True
+
+        self.send_message(client_socket, f"[System] Unknown command: {command}")
+        self.send_message(client_socket, "[System] Type /help to see available commands.")
+        return True
+
+    def send_private_message(
+        self,
+        sender_socket: socket.socket,
+        sender_nickname: str,
+        arguments: str,
+    ) -> None:
+        target_nickname, _, private_message = arguments.partition(" ")
+        if not target_nickname or not private_message:
+            self.send_message(
+                sender_socket,
+                "[System] Usage: /msg <nickname> <message>",
+            )
+            return
+
+        target_socket = self.find_client_by_nickname(target_nickname)
+        if target_socket is None:
+            self.send_message(sender_socket, f"[System] User not found: {target_nickname}")
+            return
+
+        formatted_for_target = f"[Private from {sender_nickname}] {private_message}"
+        formatted_for_sender = f"[Private to {target_nickname}] {private_message}"
+
+        try:
+            self.send_message(target_socket, formatted_for_target)
+            self.send_message(sender_socket, formatted_for_sender)
+        except OSError:
+            self.remove_client(target_socket)
+            self.send_message(sender_socket, f"[System] User disconnected: {target_nickname}")
+            return
+
+        self.log_event(f"[Private] {sender_nickname} -> {target_nickname}: {private_message}")
 
     def handle_client(
         self,
@@ -112,37 +201,42 @@ class ChatServer:
         address: tuple[str, int],
     ) -> None:
         with client_socket:
-            nickname = self.register_client(client_socket, address)
+            reader = client_socket.makefile("r", encoding=ENCODING)
+
+            nickname = self.register_client(client_socket, address, reader)
             if nickname is None:
+                reader.close()
                 return
 
-            while True:
-                try:
-                    data = client_socket.recv(BUFFER_SIZE)
-                except ConnectionResetError:
-                    break
+            try:
+                while True:
+                    try:
+                        line = reader.readline()
+                    except (ConnectionResetError, OSError):
+                        break
 
-                if not data:
-                    break
+                    if not line:
+                        break
 
-                message = data.decode(ENCODING).strip()
-                if not message:
-                    continue
+                    message = line.strip()
+                    if not message:
+                        continue
 
-                if message == "/quit":
-                    self.send_message(client_socket, "[System] Disconnecting...")
-                    break
+                    if message.startswith("/"):
+                        should_continue = self.handle_command(
+                            client_socket,
+                            nickname,
+                            message,
+                        )
+                        if not should_continue:
+                            break
+                        continue
 
-                if message == "/users":
-                    self.send_message(
-                        client_socket,
-                        f"[System] Connected users: {self.list_users()}",
-                    )
-                    continue
-
-                chat_message = f"[{nickname}] {message}"
-                self.log_event(chat_message)
-                self.broadcast(chat_message)
+                    chat_message = f"[{nickname}] {message}"
+                    self.log_event(chat_message)
+                    self.broadcast(chat_message)
+            finally:
+                reader.close()
 
         self.remove_client(client_socket)
 
@@ -164,8 +258,22 @@ class ChatServer:
                 thread.start()
 
 
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Run the TCP chat server.")
+    parser.add_argument("--host", default=DEFAULT_HOST, help="Server host to bind.")
+    parser.add_argument("--port", default=DEFAULT_PORT, type=int, help="Server port.")
+    parser.add_argument(
+        "--log-file",
+        default=DEFAULT_LOG_FILE,
+        type=Path,
+        help="Path to the server log file.",
+    )
+    return parser.parse_args()
+
+
 def main() -> None:
-    server = ChatServer()
+    args = parse_args()
+    server = ChatServer(args.host, args.port, args.log_file)
     server.serve_forever()
 
 
