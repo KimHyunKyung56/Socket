@@ -5,6 +5,7 @@ import threading
 
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 5000
+DEFAULT_MAX_MESSAGE_LENGTH = 500
 BUFFER_SIZE = 1024
 ENCODING = "utf-8"
 
@@ -27,7 +28,12 @@ def send_message(client_socket: socket.socket, message: str) -> None:
     client_socket.sendall((message + "\n").encode(ENCODING))
 
 
-def start_client(host: str, port: int, nickname: str | None = None) -> None:
+def start_client(
+    host: str,
+    port: int,
+    nickname: str | None = None,
+    max_message_length: int = DEFAULT_MAX_MESSAGE_LENGTH,
+) -> None:
     if nickname is None:
         nickname = input("Nickname: ").strip()
 
@@ -60,6 +66,10 @@ def start_client(host: str, port: int, nickname: str | None = None) -> None:
             except EOFError:
                 message = "/quit"
 
+            if len(message.strip()) > max_message_length:
+                print(f"Message must be {max_message_length} characters or less.")
+                continue
+
             try:
                 send_message(client_socket, message)
             except OSError:
@@ -75,12 +85,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--host", default=DEFAULT_HOST, help="Server host.")
     parser.add_argument("--port", default=DEFAULT_PORT, type=int, help="Server port.")
     parser.add_argument("--nickname", help="Nickname to use after connecting.")
+    parser.add_argument(
+        "--max-message-length",
+        default=DEFAULT_MAX_MESSAGE_LENGTH,
+        type=int,
+        help="Maximum length of one chat message.",
+    )
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
-    start_client(args.host, args.port, args.nickname)
+    start_client(args.host, args.port, args.nickname, args.max_message_length)
 
 
 if __name__ == "__main__":

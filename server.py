@@ -8,6 +8,10 @@ from pathlib import Path
 
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 5000
+DEFAULT_BACKLOG = 5
+DEFAULT_MAX_CLIENTS = 10
+DEFAULT_MAX_MESSAGE_LENGTH = 500
+MAX_NICKNAME_LENGTH = 20
 ENCODING = "utf-8"
 DEFAULT_LOG_FILE = Path("server.log")
 
@@ -24,10 +28,16 @@ class ChatServer:
         host: str = DEFAULT_HOST,
         port: int = DEFAULT_PORT,
         log_file: Path = DEFAULT_LOG_FILE,
+        backlog: int = DEFAULT_BACKLOG,
+        max_clients: int = DEFAULT_MAX_CLIENTS,
+        max_message_length: int = DEFAULT_MAX_MESSAGE_LENGTH,
     ) -> None:
         self.host = host
         self.port = port
         self.log_file = log_file
+        self.backlog = backlog
+        self.max_clients = max_clients
+        self.max_message_length = max_message_length
         self.clients: dict[socket.socket, str] = {}
         self.clients_lock = threading.Lock()
 
@@ -86,6 +96,10 @@ class ChatServer:
 
         return ", ".join(nicknames)
 
+    def client_count(self) -> int:
+        with self.clients_lock:
+            return len(self.clients)
+
     def find_client_by_nickname(self, nickname: str) -> socket.socket | None:
         with self.clients_lock:
             for client_socket, current_nickname in self.clients.items():
@@ -115,11 +129,22 @@ class ChatServer:
             self.send_message(client_socket, "[System] Empty nickname is not allowed.")
             return None
 
+        if len(nickname) > MAX_NICKNAME_LENGTH:
+            self.send_message(
+                client_socket,
+                f"[System] Nickname must be {MAX_NICKNAME_LENGTH} characters or less.",
+            )
+            return None
+
         if nickname.startswith("/"):
             self.send_message(client_socket, "[System] Nickname cannot start with '/'.")
             return None
 
         with self.clients_lock:
+            if len(self.clients) >= self.max_clients:
+                self.send_message(client_socket, "[System] Server is full. Try again later.")
+                return None
+
             if nickname in self.clients.values():
                 self.send_message(client_socket, "[System] Nickname already in use.")
                 return None
@@ -163,6 +188,12 @@ class ChatServer:
         self.send_message(client_socket, "[System] Type /help to see available commands.")
         return True
 
+    def discard_remaining_line(self, reader: io.TextIOWrapper) -> None:
+        while True:
+            chunk = reader.readline(1024)
+            if not chunk or chunk.endswith("\n") or len(chunk) < 1024:
+                return
+
     def send_private_message(
         self,
         sender_socket: socket.socket,
@@ -180,6 +211,17 @@ class ChatServer:
         target_socket = self.find_client_by_nickname(target_nickname)
         if target_socket is None:
             self.send_message(sender_socket, f"[System] User not found: {target_nickname}")
+            return
+
+        if target_socket is sender_socket:
+            self.send_message(sender_socket, "[System] You cannot send a private message to yourself.")
+            return
+
+        if len(private_message) > self.max_message_length:
+            self.send_message(
+                sender_socket,
+                f"[System] Private message must be {self.max_message_length} characters or less.",
+            )
             return
 
         formatted_for_target = f"[Private from {sender_nickname}] {private_message}"
@@ -211,12 +253,21 @@ class ChatServer:
             try:
                 while True:
                     try:
-                        line = reader.readline()
+                        line = reader.readline(self.max_message_length + 2)
                     except (ConnectionResetError, OSError):
                         break
 
                     if not line:
                         break
+
+                    if len(line) > self.max_message_length + 1:
+                        if not line.endswith("\n"):
+                            self.discard_remaining_line(reader)
+                        self.send_message(
+                            client_socket,
+                            f"[System] Message must be {self.max_message_length} characters or less.",
+                        )
+                        continue
 
                     message = line.strip()
                     if not message:
@@ -240,28 +291,68 @@ class ChatServer:
 
         self.remove_client(client_socket)
 
+    def shutdown(self) -> None:
+        with self.clients_lock:
+            current_clients = list(self.clients.keys())
+            self.clients.clear()
+
+        for client_socket in current_clients:
+            try:
+                self.send_message(client_socket, "[System] Server is shutting down.")
+                client_socket.close()
+            except OSError:
+                pass
+
     def serve_forever(self) -> None:
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server_socket:
-            server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            server_socket.bind((self.host, self.port))
-            server_socket.listen()
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server_socket:
+                server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                server_socket.bind((self.host, self.port))
+                server_socket.listen(self.backlog)
 
-            self.log_event(f"TCP chat server started on {self.host}:{self.port}")
-
-            while True:
-                client_socket, address = server_socket.accept()
-                thread = threading.Thread(
-                    target=self.handle_client,
-                    args=(client_socket, address),
-                    daemon=True,
+                self.log_event(
+                    "TCP chat server started on "
+                    f"{self.host}:{self.port} "
+                    f"(backlog={self.backlog}, max_clients={self.max_clients})"
                 )
-                thread.start()
+
+                while True:
+                    client_socket, address = server_socket.accept()
+                    thread = threading.Thread(
+                        target=self.handle_client,
+                        args=(client_socket, address),
+                        daemon=True,
+                    )
+                    thread.start()
+        except KeyboardInterrupt:
+            self.log_event("Server interrupted by user.")
+        finally:
+            self.shutdown()
+            self.log_event("TCP chat server stopped.")
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run the TCP chat server.")
     parser.add_argument("--host", default=DEFAULT_HOST, help="Server host to bind.")
     parser.add_argument("--port", default=DEFAULT_PORT, type=int, help="Server port.")
+    parser.add_argument(
+        "--backlog",
+        default=DEFAULT_BACKLOG,
+        type=int,
+        help="Maximum queued connection requests for listen().",
+    )
+    parser.add_argument(
+        "--max-clients",
+        default=DEFAULT_MAX_CLIENTS,
+        type=int,
+        help="Maximum number of connected clients.",
+    )
+    parser.add_argument(
+        "--max-message-length",
+        default=DEFAULT_MAX_MESSAGE_LENGTH,
+        type=int,
+        help="Maximum length of one chat message.",
+    )
     parser.add_argument(
         "--log-file",
         default=DEFAULT_LOG_FILE,
@@ -273,7 +364,14 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    server = ChatServer(args.host, args.port, args.log_file)
+    server = ChatServer(
+        host=args.host,
+        port=args.port,
+        log_file=args.log_file,
+        backlog=args.backlog,
+        max_clients=args.max_clients,
+        max_message_length=args.max_message_length,
+    )
     server.serve_forever()
 
 
